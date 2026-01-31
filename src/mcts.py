@@ -1,59 +1,60 @@
-
-import os
-
-# Set the number of threads
-# os.environ['OMP_NUM_THREADS'] = '12'
-
+"""Monte Carlo Tree Search engine with a neural evaluator for chess."""
 import random
 import math
 import chess
 import torch
-from main import ChessTranformer
-import glob
 import chess.pgn as pgn
 import time
-from typing import Optional, List
-from bin_predictor import BinPredictor
-import os
+from typing import Optional, List, Dict, Tuple, Iterable
+from src.bin_predictor import BinPredictor
 from torch.cuda.amp import autocast
-import multiprocessing
-from multiprocessing import Pool
 from itertools import accumulate
-from main import set_seed
-from nnue import NNUE
+from src.train import set_seed
+import importlib.util
+from pathlib import Path
 
 
 class ChessState:
-    def __init__(self, board=None):
+    """Immutable wrapper around a chess.Board representing a game state."""
+
+    def __init__(self, board: Optional[chess.Board] = None) -> None:
         self.board = chess.Board() if board is None else board
 
-    def get_moves(self):
+    def get_moves(self) -> List[chess.Move]:
         return list(self.board.legal_moves)
 
-    def make_move(self, move):
+    def make_move(self, move: chess.Move) -> "ChessState":
         new_board = self.board.copy()
         new_board.push(move)
         return ChessState(new_board)
 
-    def is_terminal(self):
+    def is_terminal(self) -> bool:
         return self.board.is_game_over(claim_draw=False) or self.board.is_repetition() or self.board.is_fifty_moves()
 
-    def is_win(self, player_color):
-        # Check for a win condition for the specified player color.
-        # In chess, a win could be a checkmate.
-        # This method needs to be adapted based on how you define a win for each player.
+    def is_win(self, player_color: str) -> bool:
+        """Return True if the given player_color has a win in the current terminal state."""
         if self.board.is_checkmate():
-            # Assuming 'WHITE' and 'BLACK' are used to represent player colors.
             return True if (player_color == 'WHITE' and self.board.turn == chess.WHITE) or \
                            (player_color == 'BLACK' and self.board.turn == chess.BLACK) else False
         return False
 
     @property
-    def player(self):
+    def player(self) -> str:
         return 'WHITE' if self.board.turn else 'BLACK'
 
+
 class UCTNode:
-    def __init__(self, device, move=None, move_idx=None, parent=None, state=None):
+    """Node in the UCT search tree."""
+
+    def __init__(
+        self,
+        device: str,
+        exploration_weight: float,
+        move: Optional[chess.Move] = None,
+        move_idx: Optional[int] = None,
+        parent: Optional["UCTNode"] = None,
+        state: Optional[ChessState] = None,
+    ) -> None:
         self.move: chess.Move = move
         self.move_idx = move_idx  # index of the move in parent's legal_moves list
         self.parent: Optional[UCTNode] = parent
@@ -62,46 +63,47 @@ class UCTNode:
         self.is_expanded = False  # a node is expanded if the initial evals of its children have been set
         self.applied_virtual_loss_count = 0
         self.device = device
+        self.exploration_weight = exploration_weight
         if parent is None:
             self.plies_from_root = 0
         else:
             self.plies_from_root = parent.plies_from_root + 1
 
-        self.children = {}  # Dict[move, UCTNode]
+        self.children: Dict[int, "UCTNode"] = {}  # Dict[move_idx, UCTNode]
         # For the values below, we use absolute values in [0, 1], where '1' means white wins
         self.child_total_value = torch.zeros([len(self.legal_moves)], dtype=torch.float32, device=device)
         self.child_number_visits = torch.zeros([len(self.legal_moves)], dtype=torch.float32, device=device)
 
     @property
-    def total_value(self):
-        """Value of current node from white's perspective"""
+    def total_value(self) -> float:
+        """Value of current node from white's perspective."""
         if self.is_root():
             best_move_idx = self.best_move_idx()
             return self.child_total_value[best_move_idx].item()
         return self.parent.child_total_value[self.move_idx].item()
 
     @total_value.setter
-    def total_value(self, value):
+    def total_value(self, value: float) -> None:
         self.parent.child_total_value[self.move_idx] = value
 
     @property
-    def visits(self):
+    def visits(self) -> float:
         if self.is_root():
             return self.child_number_visits.sum().item()
         return self.parent.child_number_visits[self.move_idx].item()
 
     @visits.setter
-    def visits(self, value):
+    def visits(self, value: float) -> None:
         self.parent.child_number_visits[self.move_idx] = value
 
-    def is_root(self):
+    def is_root(self) -> bool:
         return self.parent is None
 
-    def add_child(self, child_node):
+    def add_child(self, child_node: "UCTNode") -> None:
         self.children[child_node.move_idx] = child_node
 
-    def best_move_idx(self):
-        # best move is the one with the most visits, then the one with the best eval if there's a tie.
+    def best_move_idx(self) -> int:
+        """Return index of the best move according to visits and value."""
         max_visits = torch.max(self.child_number_visits).item()
         child_q = self.child_total_value / (1.0 + self.child_number_visits)
         if self.state.board.turn == chess.BLACK:
@@ -109,95 +111,101 @@ class UCTNode:
         child_q = child_q * (self.child_number_visits == max_visits).float()
         return torch.argmax(child_q).item()
 
-    def update(self, result):
+    def update(self, result: float) -> None:
         self.visits += 1
         self.total_value += result
 
-    def uct_select_child(self):
+    def uct_select_child(self) -> "UCTNode":
         assert self.is_expanded
 
         log_visits = math.log(1 + self.visits)
         child_q = self.child_total_value / (1.0 + self.child_number_visits)
         if self.state.board.turn == chess.BLACK:
             child_q = 1.0 - child_q
-        child_u = 0.04 * torch.sqrt(2 * log_visits / (1 + self.child_number_visits))
-        # child_u = 0.05 * log_visits / (1 + self.child_number_visits)
+        child_u = self.exploration_weight * torch.sqrt(2 * log_visits / (1 + self.child_number_visits))
         best_move_idx = torch.argmax(child_q + child_u).item()
 
         return self.maybe_add_child(best_move_idx)
 
-    def eval_player_perspective(self):
+    def eval_player_perspective(self) -> float:
         white_eval = self.total_value / (1 + self.visits)
         if self.state.board.turn == chess.BLACK:
             return 1.0 - white_eval
         return white_eval
 
-    def eval_based_on_children(self):
+    def eval_based_on_children(self) -> float:
         child_q = self.child_total_value / (1.0 + self.child_number_visits)
         if self.state.board.turn == chess.WHITE:
             return child_q.max().item()
         else:
             return child_q.min().item()
 
-    def add_virtual_loss(self):
+    def add_virtual_loss(self) -> None:
         current = self
         sgn = 1.0 if self.state.board.turn == chess.WHITE else -1.0
         while current is not None and current.parent is not None:  # parent is None for the root!
             if not current.is_root():
-                current.total_value += sgn
+                current.total_value += (sgn + 1.0) / 2.0 * 0.3
                 current.visits += 1
             current.applied_virtual_loss_count += 1
             current = current.parent
             sgn *= -1
 
-    def revert_virtual_loss(self):
+    def revert_virtual_loss(self) -> None:
         current = self
         sgn = 1.0 if self.state.board.turn == chess.WHITE else -1.0
         while current is not None and current.parent is not None:
             if not current.is_root():
-                current.total_value -= sgn
+                current.total_value -= (sgn + 1.0) / 2.0 * 0.3
                 current.visits -= 1
             current.applied_virtual_loss_count -= 1
             current = current.parent
             sgn *= -1
 
-    def is_terminal(self):
+    def is_terminal(self) -> bool:
         return self.state.is_terminal()
 
-    def maybe_add_child(self, move_idx):
+    def maybe_add_child(self, move_idx: int) -> "UCTNode":
         if move_idx in self.children:
             return self.children[move_idx]
         else:
             move = self.legal_moves[move_idx]
             next_state = self.state.make_move(move)
-            child_node = UCTNode(device=self.device, move=move, parent=self, state=next_state, move_idx=move_idx)
+            child_node = UCTNode(
+                device=self.device,
+                exploration_weight=self.exploration_weight,
+                move=move,
+                parent=self,
+                state=next_state,
+                move_idx=move_idx,
+            )
             self.add_child(child_node)
             return child_node
 
-    def expand(self, child_evals):
-        # child_evals is from the perspective of white
+    def expand(self, child_evals: torch.Tensor) -> None:
+        """Expand node by setting initial child evaluations (white perspective)."""
         self.is_expanded = True
         self.child_total_value = child_evals
 
-    def terminal_state_eval(self):
-        """From white's perspective."""
+    def terminal_state_eval(self) -> float:
+        """Evaluate terminal node from white's perspective."""
         board: chess.Board = self.state.board
         assert board.is_game_over(claim_draw=False) or board.is_repetition() or board.is_fifty_moves()
         if board.is_checkmate():  # current player got checkmated
             if board.turn == chess.WHITE:
-                return -0.01 + self.plies_from_root * 1e-5
+                return -0.1 + self.plies_from_root * 1e-3
             else:
-                return 1.01 - self.plies_from_root * 1e-5
+                return 1.1 - self.plies_from_root * 1e-3
         return 0.5
 
-    def backup(self, result):
-        """Back's up an eval from white's perspective."""
+    def backup(self, result: float) -> None:
+        """Back up a value from white's perspective to the root."""
         current = self
         while current is not None and current.parent is not None:
             current.update(result)
             current = current.parent
 
-    def __str__(self, level=0):
+    def __str__(self, level: int = 0) -> str:
         ret = "\t" * level
         if not self.is_root():
             ret += f"Move: {self.move}, Abs-eval: {self.total_value / (1 + self.visits):.4f}, Visits: {self.visits}, Player after move: {self.state.player}\n"
@@ -210,45 +218,103 @@ class UCTNode:
         return ret
 
 
+def load_config_from_path(config_path: str):
+    """Load a config object from a Python file exposing get_config()."""
+    config_file = Path(config_path).resolve()
+    spec = importlib.util.spec_from_file_location("config_module", config_file)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Failed to load config from: {config_file}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    if not hasattr(module, "get_config"):
+        raise AttributeError(f"{config_file} must define get_config()")
+    return module.get_config()
+
+
+def find_latest_checkpoint(search_dir: Path) -> Optional[str]:
+    """Return path to the latest checkpoint in a directory, or None if none exist."""
+    candidates = list(search_dir.glob("checkpoint_*.pth"))
+    if not candidates:
+        return None
+
+    def extract_step(path: Path) -> int:
+        try:
+            return int(path.stem.split("_")[-1])
+        except ValueError:
+            return -1
+
+    best = max(candidates, key=extract_step)
+    return str(best)
+
+
 class MCTSEngine:
+    """MCTS engine that evaluates positions with a transformer model."""
 
-    def __init__(self, root_dir=r"C:\Users\Ahmad-personal\PycharmProjects\chess_stackfish_evals", device='cpu', model_type='transformer'):
+    def __init__(
+        self,
+        config_path: str,
+        device: str = 'cuda',
+        checkpoint_path: Optional[str] = None,
+        exploration_weight: float = 0.1,
+        root_value_noise_std: float = 0.005,
+    ) -> None:
         self.device = device
-        self.model_type = model_type
-        if model_type == 'transformer':
-            transformer = ChessTranformer(
-                bin_predictor=BinPredictor(), d_model=256, num_layers=4, nhead=4, dim_feedforward=4 * 256, norm_first=False
-            # bin_predictor = BinPredictor(), d_model = 512, num_layers = 16, nhead = 8, dim_feedforward = 4 * 512
-            ).to(device=device)
-        elif model_type == 'nnue':
-            transformer = NNUE(embedding_dim=1024, num_hidden1=8, num_hidden2=32).to(device=device)
-        # root_dir = r"/mnt/c/Users/Ahmad-personal/PycharmProjects/chess_stackfish_evals"
-        checkpoint_path = glob.glob(os.path.join(root_dir, "checkpoint_*.pth"))[0]
-        checkpoint = torch.load(checkpoint_path)
-        transformer.load_state_dict(checkpoint[f'{model_type}_state_dict'])
-        transformer.eval()
-        # transformer.transformer = torch.compile(transformer.transformer)
-        self.transformer = transformer
-        self.calls_to_eval = 0
-        # The first time we call the transformer it's slow, so let's do it now not in a game!
-        self.mcts_move(ChessState(chess.Board()), time_limit=2.0, verbose=False)
-        print(f'Loaded transformer from checkpoint: {checkpoint_path}.')
+        self.exploration_weight = exploration_weight
+        self.root_value_noise_std = root_value_noise_std
 
-    def get_evals_for_all_moves(self, nodes: List[UCTNode]):
+        config = load_config_from_path(config_path)
+        trainer = config.trainer
+        model_cfg = config.model
+
+        experiment_root = Path(trainer.experiment_dir) / config.exp_name
+        checkpoint_dir = experiment_root / "checkpoints"
+
+        if checkpoint_path is None:
+            checkpoint_path = find_latest_checkpoint(checkpoint_dir)
+            if checkpoint_path is None:
+                raise FileNotFoundError(f"No checkpoints found in {checkpoint_dir}")
+
+        transformer = model_cfg.create_model(bin_predictor=BinPredictor(), device=device)
+
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        transformer.load_state_dict(checkpoint['transformer_state_dict'])
+        transformer.eval()
+        self.calls_to_eval = 0
+        print(f'Loaded transformer from checkpoint: {checkpoint_path}.')
+        # transformer = torch.compile(transformer, mode="reduce-overhead")
+        transformer = torch.compile(transformer, mode="max-autotune")
+        self.transformer = transformer
+        for _ in range(3):
+            self.mcts_move(ChessState(chess.Board()), time_limit=2.0, verbose=False)
+
+    def _add_root_value_noise(
+        self,
+        evals: torch.Tensor,
+        clamp_min: float = 0.0,
+        clamp_max: float = 1.0,
+    ) -> torch.Tensor:
+        if self.root_value_noise_std <= 0.0 or evals.numel() == 0:
+            return evals
+        noise = torch.randn_like(evals) * self.root_value_noise_std
+        return (evals + noise).clamp(clamp_min, clamp_max)
+
+
+    def get_evals_for_all_moves(self, nodes: List[UCTNode]) -> List[torch.Tensor]:
+        """Batch-evaluate all child moves for a list of nodes."""
         self.calls_to_eval += 1
         if len(nodes) == 0:
             return []
         node_separations = list(accumulate([len(node.legal_moves) for node in nodes]))[:-1]
 
-        def _get_fens_and_draw_indices(node):
-            node_fens = []
-            node_draw_indices = []
+        def _get_fens_and_draw_indices(node: UCTNode) -> Tuple[List[str], List[int]]:
+            node_fens: List[str] = []
+            node_draw_indices: List[int] = []
             board: chess.Board = node.state.board
             for idx, move in enumerate(node.legal_moves):
                 board.push(move)
                 node_fens.append(board.fen())
-                # if board.is_repetition() or board.is_fifty_moves() or board.is_stalemate():
-                #     node_draw_indices.append(idx)
+                if board.is_repetition() or board.is_fifty_moves() or board.is_stalemate():
+                    node_draw_indices.append(idx)
                 board.pop()
             return node_fens, node_draw_indices
 
@@ -259,28 +325,28 @@ class MCTSEngine:
 
         return self._compute_evals_from_fens(fens, node_separations, draw_indices)
 
-    def _compute_evals_from_fens(self, fens, node_separations, draw_indices):
-        with autocast():
+    def _compute_evals_from_fens(
+        self,
+        fens: List[str],
+        node_separations: List[int],
+        draw_indices: List[int],
+    ) -> List[torch.Tensor]:
+        """Compute win-prob evaluations for a list of FENs."""
+        with torch.autocast("cuda", dtype=torch.bfloat16):
             with torch.no_grad():
                 white_evals = self.transformer.compute_white_win_prob_from_fen(fens, device=self.device)
 
-                # white_evals, white_eval_stds = self.transformer.compute_bin_index_means_and_stds_from_fens(
-                #     fens, device=self.device)
-                # white_evals = white_evals / (self.transformer.bin_predictor.total_num_bins - 1.0)
-
                 for idx in draw_indices:
                     white_evals[idx] = 0.5
-                    # white_eval_stds[idx] = 0.0
                 white_win_probs_split = torch.tensor_split(white_evals, node_separations)
-                # white_eval_stds_split = torch.tensor_split(white_eval_stds, node_separations)
-        return white_win_probs_split
+        return list(white_win_probs_split)
 
-    def mcts(self, root: UCTNode, node_batch_size, time_limit=2.0, verbose=True) -> None:
+    def mcts(self, root: UCTNode, node_batch_size: int, time_limit: float = 2.0, verbose: bool = True) -> None:
+        """Run MCTS from root for a time budget."""
         start_time = time.time()
         i = 0
         while True:
-            # MCTS iteration process
-            nodes = []  # may have repeats
+            nodes = []
             for _ in range(node_batch_size):
                 node = root
                 while node.is_expanded:
@@ -291,14 +357,14 @@ class MCTSEngine:
             nodes_set = set(nodes)
             terminal_nodes = list(node for node in nodes_set if node.is_terminal())
             non_terminal_nodes = list(node for node in nodes_set if not node.is_terminal())
-            # print(get_evals_for_all_moves(non_terminal_nodes))
+
             for j, evals in enumerate(self.get_evals_for_all_moves(non_terminal_nodes)):
                 node = non_terminal_nodes[j]
-                # evals = evals.cpu()
+                if node.is_root():
+                    evals = self._add_root_value_noise(evals)
                 node.expand(evals)
                 node.backup(result=node.eval_based_on_children())
 
-            # Update nodes with the result
             for node in terminal_nodes:
                 node.backup(result=node.terminal_state_eval())
 
@@ -312,9 +378,15 @@ class MCTSEngine:
         if verbose:
             print(f"Completed {i} iterations in {elapsed_time:.2f} seconds.")
 
-    def mcts_move(self, game: ChessState, node_batch_size=1, time_limit=2.0, verbose=True, root=None):
-        """Continue's from root if specified, """
-        root = UCTNode(device=self.device, state=game)
+    def mcts_move(
+        self,
+        game: ChessState,
+        node_batch_size: int = 1,
+        time_limit: float = 2.0,
+        verbose: bool = True,
+    ) -> Tuple[chess.Move, float]:
+        """Return best move and evaluation after running MCTS."""
+        root = UCTNode(device=self.device, exploration_weight=self.exploration_weight, state=game)
         with torch.no_grad():
             self.mcts(root, node_batch_size=node_batch_size, time_limit=time_limit, verbose=verbose)
         if verbose:
@@ -325,8 +397,8 @@ class MCTSEngine:
         eval = root.child_total_value[best_move_idx] / (1 + root.child_number_visits[best_move_idx])
         return best_move, eval.item()
 
-    def get_evals(self, board, moves):
-        # evals are from current player's perspective
+    def get_evals(self, board: chess.Board, moves: List[chess.Move]) -> List[float]:
+        """Return evaluations for candidate moves from the current player's perspective."""
         fen_list = []
         for move in moves:
             board.push(move)
@@ -339,31 +411,28 @@ class MCTSEngine:
             evals = evals if board.turn == chess.WHITE else 1.0 - evals
             return evals.detach().cpu().tolist()
 
-def run():
-    # To use:
-    # Initialize a chess board
-    # fen = "3r2k1/3q1ppp/1p6/p2p4/1N2n3/4PQP1/5P1P/5RK1 w - - 0 30"
-    # torch.jit.enable_onednn_fusion(True)
-    # print(torch._dynamo.list_backends())
 
-    set_seed(42)
-    engine = MCTSEngine(model_type='nnue')
+def run() -> None:
+    """Run a short demo game using MCTS."""
+    set_seed(44)
+    engine = MCTSEngine(
+        config_path='configs/test_config.py',
+    )
     board = chess.Board()
     state = ChessState(board)
     evals = [0.5]
     board.push(random.choice(list(board.legal_moves)))
-    # evals = []
     plies = 0
     print(board)
-    while not state.is_terminal() and plies < 10:
+    while not state.is_terminal() and plies < 15:
         plies += 1
-        move, eval = engine.mcts_move(state, node_batch_size=1, time_limit=3)
+        move, eval = engine.mcts_move(state, node_batch_size=1, time_limit=10)
         print('Making move:', move, 'eval:', round(eval, 3), 'ply:', plies)
         state = state.make_move(move)
         print(state.board)
         if plies % 5 == 0:
             print(pgn.Game.from_board(state.board))
-        if state.board.turn == chess.WHITE:  # eval is originally from black's perspective
+        if state.board.turn == chess.WHITE:
             eval = 1.0 - eval
         evals.append(eval)
 
@@ -378,7 +447,6 @@ def run():
         node = node.next()
         node.comment = f"[%wp {eval:.4f}]"
 
-    # Export to PGN
     pgn_string = game.accept(pgn.StringExporter(headers=True, variations=True, comments=True))
 
     print(pgn_string)
@@ -386,7 +454,4 @@ def run():
 
 
 if __name__ == '__main__':
-    # import cProfile
-    # cProfile.run('run()')
     run()
-

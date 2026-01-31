@@ -1,14 +1,15 @@
-
 import json
 import torch
 import pickle
+import numpy as np
 from torch.utils.data import Dataset
 from tqdm import tqdm
 import os
 from dataclasses import dataclass, field
 from typing import List
 import mmap
-from bin_predictor import BinPredictor
+from src.bin_predictor import BinPredictor
+from src.dataset.fen_utils import expand_fen_string
 
 
 FEN_CHAR_TO_INDEX = {
@@ -30,37 +31,9 @@ class RawIO:
     mate: int  # number of moves till mate, if negative then black mates white. If 0 no mate was found
 
 
-def remove_full_half_moves_from_fen(fen):
-    parts = fen.split(' ')
-    if len(parts) == 6:
-        return ' '.join(parts[:-2])
-    else:
-        return fen
-
-
-def expand_fen_string(fen):
-    # Split the FEN string into its components
-    parts = fen.split(' ')
-    board, rest = parts[0], parts[1:]
-
-    # Expand the first component
-    expanded_board = ""
-    for char in board:
-        if char.isdigit():
-            # Replace digit with corresponding number of dots
-            expanded_board += '.' * int(char)
-        else:
-            # Keep non-digit characters as they are
-            expanded_board += char
-
-    # Reassemble the FEN string
-    expanded_fen = ' '.join([expanded_board] + rest)
-    return remove_full_half_moves_from_fen(expanded_fen)
-
-
 class JSONLinesChessDataset(Dataset):
     """The lichess evaluation dataset."""
-    def __init__(self, file_path, index_file='index.pkl'):
+    def __init__(self, file_path, index_file='index.npy'):
         self.file_path = file_path
         self.index_file = index_file
         self.offsets = self._load_or_build_index()
@@ -72,25 +45,25 @@ class JSONLinesChessDataset(Dataset):
             self.data = mmap.mmap(f.fileno(), length=0, access=mmap.ACCESS_READ)
 
     def _load_or_build_index(self):
-        # Check if the index file exists; load it if it does, or build it if it doesn't
         if os.path.exists(self.index_file):
             print('Loading index from file.')
-            with open(self.index_file, 'rb') as f:
-                return pickle.load(f)
+            return np.memmap(self.index_file, mode='r', dtype=np.int64)
         else:
             print('Creating dataset index file.')
-            offsets = [0]  # Start from the beginning of the file
+            offsets = [0]
             with open(self.file_path, 'rb') as file:
-                # Setup tqdm for manual updates
                 pbar = tqdm(desc="Indexing", unit="lines")
                 while line := file.readline():
                     offsets.append(file.tell())
-                    pbar.update(1)  # Manual update by 1 for each line processed
+                    pbar.update(1)
                 pbar.close()
-            with open(self.index_file, 'wb') as f:
-                pickle.dump(offsets, f)
-                print(f'Index file saved to: {self.index_file}')
-            return offsets
+
+            offsets_array = np.asarray(offsets, dtype=np.int64)
+            memmap = np.memmap(self.index_file, mode='w+', dtype=np.int64, shape=offsets_array.shape)
+            memmap[:] = offsets_array[:]
+            memmap.flush()
+            print(f'Index file saved to: {self.index_file}')
+            return np.memmap(self.index_file, mode='r', dtype=np.int64)
 
     def __len__(self):
         # The total number of items is the number of offsets minus one (for the end of the file)
@@ -148,7 +121,7 @@ class JSONLinesLichessDataset(Dataset):
         self.file_path = file_path
         if index_file is None:
             base_name, _ = os.path.splitext(file_path)
-            self.index_file = f'{base_name}_index.pkl'
+            self.index_file = f'{base_name}_index.npy'
         else:
             self.index_file = index_file
         self.offsets = self._load_or_build_index()
@@ -160,25 +133,25 @@ class JSONLinesLichessDataset(Dataset):
             self.data = mmap.mmap(f.fileno(), length=0, access=mmap.ACCESS_READ)
 
     def _load_or_build_index(self):
-        # Check if the index file exists; load it if it does, or build it if it doesn't
         if os.path.exists(self.index_file):
             print('Loading index from file.')
-            with open(self.index_file, 'rb') as f:
-                return pickle.load(f)
+            return np.memmap(self.index_file, mode='r', dtype=np.int64)
         else:
             print('Creating dataset index file.')
-            offsets = [0]  # Start from the beginning of the file
+            offsets = [0]
             with open(self.file_path, 'rb') as file:
-                # Setup tqdm for manual updates
                 pbar = tqdm(desc="Indexing", unit="lines")
                 while line := file.readline():
                     offsets.append(file.tell())
-                    pbar.update(1)  # Manual update by 1 for each line processed
+                    pbar.update(1)
                 pbar.close()
-            with open(self.index_file, 'wb') as f:
-                pickle.dump(offsets, f)
-                print(f'Index file saved to: {self.index_file}')
-            return offsets
+
+            offsets_array = np.asarray(offsets, dtype=np.int64)
+            memmap = np.memmap(self.index_file, mode='w+', dtype=np.int64, shape=offsets_array.shape)
+            memmap[:] = offsets_array[:]
+            memmap.flush()
+            print(f'Index file saved to: {self.index_file}')
+            return np.memmap(self.index_file, mode='r', dtype=np.int64)
 
     def __len__(self):
         # The total number of items is the number of offsets minus one (for the end of the file)
@@ -283,117 +256,3 @@ def collate_fn(batch: List[RawIO], bin_predictor: BinPredictor) -> TransformerIO
         expanded_fens=[x.expanded_fen for x in batch],
         bin_classes=torch.tensor(bin_classes, dtype=torch.long)
     )
-
-
-def fen_to_halfkp(expanded_fen):
-    # (2 colours) * (5 piece types) * (64 square of piece) * (64 square of same colour king)
-    # There are only 5 piece types cos king is not counted
-    # halfkp_idx = piece_square + (p_idx + king_square * 10) * 64
-
-    piece_sq = 0
-    white_indices = []
-    black_indices = []
-    wking_sq = -1
-    bking_sq = -1
-    piece_to_idx = {'P': 0, 'N': 1, 'B': 2, 'R': 3, 'Q': 4, 'p': 5, 'n': 6, 'b': 7, 'r': 8, 'q': 9}
-
-    for c in expanded_fen:
-        if piece_sq >= 64:
-            break
-        if c == '/':
-            continue
-        elif c == '.':
-            pass
-        elif c == 'k':
-            bking_sq = piece_sq
-        elif c == 'K':
-            wking_sq = piece_sq
-        elif c.isupper():
-            white_indices.append(
-                piece_sq + 64 * piece_to_idx[c]
-            )
-        elif c.islower():
-            black_indices.append(
-                piece_sq + 64 * piece_to_idx[c]
-            )
-        else:
-            raise ValueError(f'Unexpected character in fen string: {c}')
-        piece_sq += 1
-
-    assert wking_sq >= 0
-    assert bking_sq >= 0
-    white_indices = [v + 64 * 10 * wking_sq for v in white_indices]
-    black_indices = [v + 64 * 10 * bking_sq for v in black_indices]
-    return white_indices, black_indices
-
-
-@dataclass
-class NNUEIO:
-    halfkp_indices: torch.IntTensor  # (B, 2, 16). Padded with (10*64*64)'s
-    cp_evals: torch.LongTensor  # (B)
-    mates: torch.IntTensor
-    expanded_fens: List[str]
-    side_to_move: torch.Tensor  # 1 for white, 0 for black
-    white_win_prob: torch.Tensor = field(init=False)  # (B)
-    white_win_prob_with_mates: torch.Tensor = field(init=False)  # (B)
-
-    def __post_init__(self):
-        # For conversion of centipawns to win percentage see https://lichess.org/page/accuracy
-        # Win% = 50 + 50 * (2 / (1 + exp(-0.00368208 * centipawns)) - 1)
-        self.white_win_prob = 1.0 / (1.0 + torch.exp(-0.00368208 * self.cp_evals))
-
-        mates = self.mates.clone()
-        mates[mates == 0] = torch.inf
-        mate_sgn = 2 * (mates > 0).float() - 1
-        mate_prob = (4 / (mates + 3 * mate_sgn) + 1) * 0.5
-        # print('Mates:')
-        # print(mates)
-        # print('Mate prob:')
-        # print(mate_prob)
-        # print('Paired:')
-        # print(list(zip(mates.tolist(), mate_prob.tolist())))
-        # exit(0)
-
-        self.white_win_prob_with_mates = 0.8 * self.white_win_prob + 0.2 * mate_prob
-
-    def to(self, device):
-        return NNUEIO(
-            halfkp_indices=self.halfkp_indices.to(device=device),
-            cp_evals=self.cp_evals.to(device=device),
-            mates=self.mates.to(device=device),
-            expanded_fens=self.expanded_fens,
-            side_to_move=self.side_to_move.to(device=device),
-        )
-
-
-def nnue_collate_fn(batch: List[RawIO]):
-    half_kps = []
-    side_to_move = []
-
-    for batch_elt in batch:
-        white_indices, black_indices = fen_to_halfkp(batch_elt.expanded_fen)
-        white_indices = white_indices + [10*64*64] * (16 - len(white_indices))
-        black_indices = black_indices + [10*64*64] * (16 - len(black_indices))
-        half_kps.append(
-            torch.stack([
-                torch.tensor(white_indices, dtype=torch.long),
-                torch.tensor(black_indices, dtype=torch.long)
-            ])
-        )
-        stm_char = batch_elt.expanded_fen.split(' ')[1]
-        assert stm_char in ['w', 'b']
-        if stm_char == 'w':
-            side_to_move.append(1)
-        else:
-            side_to_move.append(0)
-
-    eval_batch = torch.tensor([x.cp_eval for x in batch], dtype=torch.long)
-    mates = torch.tensor([x.mate for x in batch], dtype=torch.float32)
-    return NNUEIO(
-        halfkp_indices=torch.stack(half_kps),
-        cp_evals=eval_batch,
-        mates=mates,
-        expanded_fens=[x.expanded_fen for x in batch],
-        side_to_move=torch.tensor(side_to_move)
-    )
-
