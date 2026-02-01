@@ -14,6 +14,12 @@ def run_match(
     player2_checkpoint: str | None,
     player1_exploration_weight: float,
     player2_exploration_weight: float,
+    player1_reuse_tree: bool,
+    player2_reuse_tree: bool,
+    player1_ponder: bool,
+    player2_ponder: bool,
+    player1_use_mixedcp_mapper: bool,
+    player2_use_mixedcp_mapper: bool,
     num_games: int,
     time_limit: float,
     node_batch_size: int,
@@ -26,11 +32,17 @@ def run_match(
         config_path=player1_config,
         checkpoint_path=player1_checkpoint,
         exploration_weight=player1_exploration_weight,
+        reuse_tree=player1_reuse_tree,
+        ponder=player1_ponder,
+        config_kwargs={"use_mixedcp_mapper": player1_use_mixedcp_mapper},
     )
     player2_engine = MCTSEngine(
         config_path=player2_config,
         checkpoint_path=player2_checkpoint,
         exploration_weight=player2_exploration_weight,
+        reuse_tree=player2_reuse_tree,
+        ponder=player2_ponder,
+        config_kwargs={"use_mixedcp_mapper": player2_use_mixedcp_mapper},
     )
 
     stats = {
@@ -102,6 +114,12 @@ def main() -> None:
     parser.add_argument("--player2-checkpoint", default=None)
     parser.add_argument("--player1-exploration-weight", type=float, default=0.1)
     parser.add_argument("--player2-exploration-weight", type=float, default=0.1)
+    parser.add_argument("--player1-reuse-tree", action="store_true")
+    parser.add_argument("--player2-reuse-tree", action="store_true")
+    parser.add_argument("--player1-ponder", action="store_true")
+    parser.add_argument("--player2-ponder", action="store_true")
+    parser.add_argument("--player1-use-mixedcp-mapper", action="store_true")
+    parser.add_argument("--player2-use-mixedcp-mapper", action="store_true")
     parser.add_argument("--num-games", type=int, default=2)
     parser.add_argument("--time-limit", type=float, default=2.0)
     parser.add_argument("--node-batch-size", type=int, default=1)
@@ -116,13 +134,18 @@ def main() -> None:
         player2_checkpoint=args.player2_checkpoint,
         player1_exploration_weight=args.player1_exploration_weight,
         player2_exploration_weight=args.player2_exploration_weight,
+        player1_reuse_tree=args.player1_reuse_tree,
+        player2_reuse_tree=args.player2_reuse_tree,
+        player1_ponder=args.player1_ponder,
+        player2_ponder=args.player2_ponder,
+        player1_use_mixedcp_mapper=args.player1_use_mixedcp_mapper,
+        player2_use_mixedcp_mapper=args.player2_use_mixedcp_mapper,
         num_games=args.num_games,
         time_limit=args.time_limit,
         node_batch_size=args.node_batch_size,
         seed=args.seed,
         verbose=not args.quiet,
     )
-    print("Stats:", stats)
 
 
 if __name__ == "__main__":

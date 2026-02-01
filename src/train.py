@@ -331,7 +331,7 @@ def train(
             with torch.no_grad():
                 batch = batch.to(device=trainer.device)
                 num_classes = transformer.bin_predictor.total_num_bins
-                sigma = transformer._get_soft_target_sigma(num_classes, 0.8)
+                sigma = transformer._get_soft_target_sigma(num_classes, 1.0)
 
                 class_indices = torch.arange(num_classes, device=trainer.device).unsqueeze(0)
                 distances_sq = (class_indices - batch.bin_classes.unsqueeze(1)).float().pow(2)

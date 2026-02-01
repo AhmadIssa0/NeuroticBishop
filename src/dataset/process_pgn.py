@@ -114,7 +114,7 @@ def extract_fens_and_evals_to_jsonl(pgn_zst_path, output_path):
 #             pbar = tqdm(desc="Extracting games", unit=" games")
 #             while True:
 #                 game = chess.pgn.read_game(text_reader)
-#                 if game is None:
+#                 if game is None:o
 #                     break  # End of the PGN file
 #
 #                 pbar.update(1)  # Manually update tqdm for each game processed
@@ -168,7 +168,7 @@ if __name__ == '__main__':
     # (checkmates are included as mate in +/-1)
     extract_fens_and_evals_to_jsonl(
         # r"C:\Users\Ahmad-personal\Downloads\lichess_db_standard_rated_2024-03.pgn.zst",
-        r"C:\Users\Ahmad-personal\PycharmProjects\chess_stackfish_evals\data\lichess_db_standard_rated_2024-02.pgn.zst",
-        r"C:\Users\Ahmad-personal\PycharmProjects\chess_stackfish_evals\data\lichess_db_standard_rated_2024-02.jsonl",
+        r"C:\Users\Ahmad-personal\PycharmProjects\chess_stockfish_evals_v2\data\lichess_db_standard_rated_2025-11.pgn.zst",
+        r"C:\Users\Ahmad-personal\PycharmProjects\chess_stockfish_evals_v2\data\lichess_db_standard_rated_2025-11.jsonl",
     )
 

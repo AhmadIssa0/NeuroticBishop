@@ -5,6 +5,7 @@ import chess
 import torch
 import chess.pgn as pgn
 import time
+import threading
 from typing import Optional, List, Dict, Tuple, Iterable
 from src.bin_predictor import BinPredictor
 from torch.cuda.amp import autocast
@@ -218,7 +219,7 @@ class UCTNode:
         return ret
 
 
-def load_config_from_path(config_path: str):
+def load_config_from_path(config_path: str, **kwargs):
     """Load a config object from a Python file exposing get_config()."""
     config_file = Path(config_path).resolve()
     spec = importlib.util.spec_from_file_location("config_module", config_file)
@@ -228,7 +229,7 @@ def load_config_from_path(config_path: str):
     spec.loader.exec_module(module)
     if not hasattr(module, "get_config"):
         raise AttributeError(f"{config_file} must define get_config()")
-    return module.get_config()
+    return module.get_config(**kwargs)
 
 
 def find_latest_checkpoint(search_dir: Path) -> Optional[str]:
@@ -255,14 +256,22 @@ class MCTSEngine:
         config_path: str,
         device: str = 'cuda',
         checkpoint_path: Optional[str] = None,
-        exploration_weight: float = 0.1,
+        exploration_weight: float = 0.07,
         root_value_noise_std: float = 0.005,
+        reuse_tree: bool = False,
+        ponder: bool = False,
+        config_kwargs: Optional[dict] = None,
     ) -> None:
         self.device = device
         self.exploration_weight = exploration_weight
         self.root_value_noise_std = root_value_noise_std
+        self.reuse_tree = reuse_tree
+        self.ponder = ponder
+        self._saved_root: Optional[UCTNode] = None
+        self._ponder_thread: Optional[threading.Thread] = None
+        self._ponder_stop = threading.Event()
 
-        config = load_config_from_path(config_path)
+        config = load_config_from_path(config_path, **(config_kwargs or {}))
         trainer = config.trainer
         model_cfg = config.model
 
@@ -281,11 +290,22 @@ class MCTSEngine:
         transformer.eval()
         self.calls_to_eval = 0
         print(f'Loaded transformer from checkpoint: {checkpoint_path}.')
-        # transformer = torch.compile(transformer, mode="reduce-overhead")
-        transformer = torch.compile(transformer, mode="max-autotune")
+        transformer = torch.compile(transformer, mode="reduce-overhead")
+        # transformer = torch.compile(transformer, mode="max-autotune")
         self.transformer = transformer
-        for _ in range(3):
+        for _ in range(2):
             self.mcts_move(ChessState(chess.Board()), time_limit=2.0, verbose=False)
+
+    def _stop_ponder(self) -> None:
+        if self._ponder_thread is not None and self._ponder_thread.is_alive():
+            self._ponder_stop.set()
+            self._ponder_thread.join()
+        self._ponder_stop.clear()
+
+    def _ponder_loop(self, root: UCTNode, node_batch_size: int) -> None:
+        while not self._ponder_stop.is_set():
+            with torch.no_grad():
+                self.mcts(root, node_batch_size=node_batch_size, time_limit=0.25, verbose=False)
 
     def _add_root_value_noise(
         self,
@@ -378,6 +398,21 @@ class MCTSEngine:
         if verbose:
             print(f"Completed {i} iterations in {elapsed_time:.2f} seconds.")
 
+    def _find_matching_root(self, game: ChessState) -> Optional[UCTNode]:
+        if self._saved_root is None:
+            return None
+        target_fen = game.board.fen()
+        if self._saved_root.state.board.fen() == target_fen:
+            return self._saved_root
+
+        # Check one ply (opponent's reply)
+        for move_idx in range(len(self._saved_root.legal_moves)):
+            child = self._saved_root.maybe_add_child(move_idx)
+            if child.state.board.fen() == target_fen:
+                return child
+
+        return None
+
     def mcts_move(
         self,
         game: ChessState,
@@ -386,15 +421,54 @@ class MCTSEngine:
         verbose: bool = True,
     ) -> Tuple[chess.Move, float]:
         """Return best move and evaluation after running MCTS."""
-        root = UCTNode(device=self.device, exploration_weight=self.exploration_weight, state=game)
+        self._stop_ponder()
+        root: Optional[UCTNode] = None
+        saved_visits = 0.0
+        if self.reuse_tree and self._saved_root is not None:
+            matched = self._find_matching_root(game)
+            if matched is None:
+                print("MCTS reuse_tree: no matching node found (new game or game ended). Starting fresh root.")
+            else:
+                matched.parent = None
+                matched.move = None
+                matched.move_idx = None
+                matched.plies_from_root = 0
+                root = matched
+                saved_visits = root.visits
+
+        if root is None:
+            root = UCTNode(device=self.device, exploration_weight=self.exploration_weight, state=game)
+
         with torch.no_grad():
             self.mcts(root, node_batch_size=node_batch_size, time_limit=time_limit, verbose=verbose)
         if verbose:
             print(root)
 
+        if self.reuse_tree and saved_visits > 0:
+            print(f"MCTS reuse_tree: saved {int(saved_visits)} visits by reusing the tree.")
+
         best_move_idx = root.best_move_idx()
         best_move = root.legal_moves[best_move_idx]
         eval = root.child_total_value[best_move_idx] / (1 + root.child_number_visits[best_move_idx])
+
+        if self.reuse_tree:
+            next_root = root.maybe_add_child(best_move_idx)
+            next_root.parent = None
+            next_root.move = None
+            next_root.move_idx = None
+            next_root.plies_from_root = 0
+            self._saved_root = next_root
+        else:
+            self._saved_root = root
+
+        if self.ponder and self._saved_root is not None and not self._saved_root.is_terminal():
+            self._ponder_thread = threading.Thread(
+                target=self._ponder_loop,
+                args=(self._saved_root, node_batch_size),
+                daemon=True,
+            )
+            self._ponder_thread.start()
+
         return best_move, eval.item()
 
     def get_evals(self, board: chess.Board, moves: List[chess.Move]) -> List[float]:

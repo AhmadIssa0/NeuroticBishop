@@ -1,9 +1,10 @@
 from dataclasses import dataclass, field
-from typing import Optional, List
+from typing import Optional, List, Callable
 from abc import ABC, abstractmethod
 from src.bin_predictor import BinPredictor
 from src.models.model import ChessTransformer
 from src.models.relative_position_model import ChessRelativeTransformer
+from src.models.model import WinProbMapper
 
 
 @dataclass
@@ -24,11 +25,13 @@ class TransformerConfig(ModelConfig):
     dim_feedforward: Optional[int] = None
     norm_first: bool = True
     use_gelu: bool = False
+    win_prob_mapper_fn: Optional[Callable[[BinPredictor], WinProbMapper]] = None
 
     def resolved_dim_feedforward(self) -> int:
         return self.dim_feedforward if self.dim_feedforward is not None else 4 * self.d_model
 
     def create_model(self, bin_predictor: BinPredictor, device: str):
+        win_prob_mapper = self.win_prob_mapper_fn(bin_predictor) if self.win_prob_mapper_fn else None
         return ChessTransformer(
             bin_predictor=bin_predictor,
             d_model=self.d_model,
@@ -37,6 +40,7 @@ class TransformerConfig(ModelConfig):
             dim_feedforward=self.resolved_dim_feedforward(),
             norm_first=self.norm_first,
             use_gelu=self.use_gelu,
+            win_prob_mapper=win_prob_mapper,
         ).to(device=device)
 
 
