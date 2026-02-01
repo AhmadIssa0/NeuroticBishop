@@ -74,6 +74,12 @@ class UCTNode:
         # For the values below, we use absolute values in [0, 1], where '1' means white wins
         self.child_total_value = torch.zeros([len(self.legal_moves)], dtype=torch.float32, device=device)
         self.child_number_visits = torch.zeros([len(self.legal_moves)], dtype=torch.float32, device=device)
+        self.child_priors = torch.full(
+            [len(self.legal_moves)],
+            1.0 / max(1, len(self.legal_moves)),
+            dtype=torch.float32,
+            device=device,
+        )
 
     @property
     def total_value(self) -> float:
@@ -119,13 +125,17 @@ class UCTNode:
     def uct_select_child(self) -> "UCTNode":
         assert self.is_expanded
 
-        log_visits = math.log(1 + self.visits)
         child_q = self.child_total_value / (1.0 + self.child_number_visits)
         if self.state.board.turn == chess.BLACK:
             child_q = 1.0 - child_q
-        child_u = self.exploration_weight * torch.sqrt(2 * log_visits / (1 + self.child_number_visits))
-        best_move_idx = torch.argmax(child_q + child_u).item()
 
+        parent_visits = self.visits
+        # print(f"weight: {self.exploration_weight}, priors: {self.child_priors}, visits: {parent_visits}, q: {child_q},")
+        child_u = self.exploration_weight * self.child_priors * torch.sqrt(
+            torch.tensor(parent_visits, device=self.device) + 1.0
+        ) / (1.0 + self.child_number_visits)
+
+        best_move_idx = torch.argmax(child_q + child_u).item()
         return self.maybe_add_child(best_move_idx)
 
     def eval_player_perspective(self) -> float:
@@ -183,10 +193,12 @@ class UCTNode:
             self.add_child(child_node)
             return child_node
 
-    def expand(self, child_evals: torch.Tensor) -> None:
+    def expand(self, child_evals: torch.Tensor, child_priors: Optional[torch.Tensor] = None) -> None:
         """Expand node by setting initial child evaluations (white perspective)."""
         self.is_expanded = True
         self.child_total_value = child_evals
+        if child_priors is not None and child_priors.numel() == self.child_priors.numel():
+            self.child_priors = child_priors
 
     def terminal_state_eval(self) -> float:
         """Evaluate terminal node from white's perspective."""
@@ -256,20 +268,26 @@ class MCTSEngine:
         config_path: str,
         device: str = 'cuda',
         checkpoint_path: Optional[str] = None,
-        exploration_weight: float = 0.07,
-        root_value_noise_std: float = 0.005,
+        exploration_weight: float = 1.0,
         reuse_tree: bool = False,
         ponder: bool = False,
         config_kwargs: Optional[dict] = None,
+        prior_temperature: float = 0.1,
+        root_dirichlet_alpha: float = 0.3,
+        root_dirichlet_eps: float = 0.02,
     ) -> None:
         self.device = device
         self.exploration_weight = exploration_weight
-        self.root_value_noise_std = root_value_noise_std
         self.reuse_tree = reuse_tree
         self.ponder = ponder
         self._saved_root: Optional[UCTNode] = None
         self._ponder_thread: Optional[threading.Thread] = None
         self._ponder_stop = threading.Event()
+
+        # NEW: PUCT root priors temperature + Dirichlet noise
+        self.prior_temperature = float(prior_temperature)
+        self.root_dirichlet_alpha = float(root_dirichlet_alpha)
+        self.root_dirichlet_eps = float(root_dirichlet_eps)
 
         config = load_config_from_path(config_path, **(config_kwargs or {}))
         trainer = config.trainer
@@ -306,18 +324,6 @@ class MCTSEngine:
         while not self._ponder_stop.is_set():
             with torch.no_grad():
                 self.mcts(root, node_batch_size=node_batch_size, time_limit=0.25, verbose=False)
-
-    def _add_root_value_noise(
-        self,
-        evals: torch.Tensor,
-        clamp_min: float = 0.0,
-        clamp_max: float = 1.0,
-    ) -> torch.Tensor:
-        if self.root_value_noise_std <= 0.0 or evals.numel() == 0:
-            return evals
-        noise = torch.randn_like(evals) * self.root_value_noise_std
-        return (evals + noise).clamp(clamp_min, clamp_max)
-
 
     def get_evals_for_all_moves(self, nodes: List[UCTNode]) -> List[torch.Tensor]:
         """Batch-evaluate all child moves for a list of nodes."""
@@ -361,6 +367,22 @@ class MCTSEngine:
                 white_win_probs_split = torch.tensor_split(white_evals, node_separations)
         return list(white_win_probs_split)
 
+    def _apply_root_prior_noise(self, priors: torch.Tensor) -> torch.Tensor:
+        if priors.numel() == 0:
+            return priors
+        if self.root_dirichlet_eps <= 0.0 or self.root_dirichlet_alpha <= 0.0:
+            return priors
+        alpha = self.root_dirichlet_alpha
+        eps = self.root_dirichlet_eps
+        noise = torch.distributions.Dirichlet(
+            torch.full_like(priors, alpha)
+        ).sample()
+        return (1.0 - eps) * priors + eps * noise
+
+    def _temperatured_softmax(self, logits: torch.Tensor, temperature: float) -> torch.Tensor:
+        t = max(1e-6, float(temperature))
+        return torch.softmax(logits / t, dim=0)
+
     def mcts(self, root: UCTNode, node_batch_size: int, time_limit: float = 2.0, verbose: bool = True) -> None:
         """Run MCTS from root for a time budget."""
         start_time = time.time()
@@ -380,9 +402,16 @@ class MCTSEngine:
 
             for j, evals in enumerate(self.get_evals_for_all_moves(non_terminal_nodes)):
                 node = non_terminal_nodes[j]
+
+                priors = evals.clone()
+                if node.state.board.turn == chess.BLACK:
+                    priors = 1.0 - priors
+
+                priors = self._temperatured_softmax(priors, self.prior_temperature)
                 if node.is_root():
-                    evals = self._add_root_value_noise(evals)
-                node.expand(evals)
+                    priors = self._apply_root_prior_noise(priors)
+
+                node.expand(evals, child_priors=priors)
                 node.backup(result=node.eval_based_on_children())
 
             for node in terminal_nodes:
