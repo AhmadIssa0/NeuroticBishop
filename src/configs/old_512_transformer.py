@@ -30,7 +30,7 @@ def get_config(use_mixedcp_mapper=True):
             eval_batch_size=512,
             num_workers=2,
             prefetch_factor=5,
-            keep_checkpoint_iters=[1_245_000],
+            keep_checkpoint_iters=[1_245_000, 1_497_000],
         ),
         exp_name="old_512_transformer",
         notes="old pretty stable run with different BinPredictor, continued training with new BinPredictor",
